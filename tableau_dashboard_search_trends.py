@@ -101,8 +101,8 @@ build__search_vol_bucket_base_new = DdSnowflakeSqlOperatorV2(
             WHEN search_type = 'core_search' THEN 'store_search' 
             WHEN suggestion_type = 'cuisine_filter' THEN 'cuisine_filter'
           ELSE search_type END AS search_type -- Dedup for dish narrowing feature on 03-15-2024
-        , dd_session_id || search_term || dd_device_id || search_type AS search_id
-        , search_timestamp_pst
+        , dd_session_id || search_term || dd_device_id AS search_id
+        , SEARCH_EVENT_START_TIMESTAMP
         , dd_device_id 
         , dd_session_id 
         , is_search_converted
@@ -119,35 +119,10 @@ build__search_vol_bucket_base_new = DdSnowflakeSqlOperatorV2(
         , experience
         FROM edw.consumer.fact_search fs
         LEFT JOIN public.dimension_district as dis on dis.district_id = fs.district_id
-        WHERE search_timestamp_pst_date >= '2023-11-01'
-        AND search_type IN ('core_search', 'vertical_search_from_tab', 'cuisine_filter', 'cuisine_filter_from_browse_tab', 'vertical_search_from_landing', 'item_first_search')
+        WHERE SEARCH_EVENT_START_TIMESTAMP::date >= '2023-11-01' -- search event start goes as early as 2023-10-05
+        AND search_type NOT LIKE '%store_sugg%' AND search_type NOT LIKE '%bounced%' AND search_type NOT LIKE '%doubledash%' --IN ('core_search', 'vertical_search_from_tab', 'cuisine_filter', 'cuisine_filter_from_browse_tab', 'vertical_search_from_landing', 'item_first_search')
           AND experience = 'doordash'
         
-        UNION ALL -- append histoical data prior to 2023-11-01
-
-        SELECT 
-            search_term
-        ,   search_type
-        ,   search_id 
-        ,   search_timestamp_pst
-        ,   dd_device_id 
-        ,   dd_session_id 
-        ,   is_search_converted
-        ,   first_converted_position
-        ,   is_search_clicked
-        ,   first_clicked_position
-        ,   num_store_results
-        ,   platform
-        ,   district_name
-        ,   origin
-        ,   country_name
-        ,   submarket_name
-        ,   region_name
-        ,   'doordash' AS experience
-        FROM proddb.public.fact_core_search_metrics_archive
-        WHERE search_timestamp_pst_date >= current_date - interval '2 years' 
-            AND search_timestamp_pst_date < '2023-11-01'
-            AND search_type = 'store_search'
         )
         , search_volume AS (
         SELECT
@@ -155,10 +130,6 @@ build__search_vol_bucket_base_new = DdSnowflakeSqlOperatorV2(
             , APPROX_COUNT_DISTINCT(search_id) AS search_sessions
             , SUM(search_sessions) over(order by search_sessions desc) AS volume_cum_sum
         FROM search_base s
-        LEFT JOIN
-            public.dimension_query_to_vertical_mapping_and_item_score_analytics_dashboard i
-        ON
-            LOWER(s.search_term) = LOWER(i.search_term)
         GROUP BY 1
         )
         SELECT
@@ -230,7 +201,7 @@ build__search_state_usage_rate_new = DdSnowflakeSqlOperatorV2(
                 t1.dd_device_id || t1.event_date
             ) AS daily_dd_visits
             , APPROX_COUNT_DISTINCT(
-                t2.dd_device_id||t2.search_timestamp_pst::date
+                t2.dd_device_id||t2.SEARCH_EVENT_START_TIMESTAMP::date
             ) AS visit_w_search_session
             , APPROX_COUNT_DISTINCT(
                 t2.search_id
@@ -267,7 +238,7 @@ build__search_state_usage_rate_new = DdSnowflakeSqlOperatorV2(
             
             LEFT JOIN
                 search_base as t2
-                ON t1.event_date = t2.search_timestamp_pst::date
+                ON t1.event_date = t2.SEARCH_EVENT_START_TIMESTAMP::date
                 AND t1.dd_device_id = t2.dd_device_id
 
             LEFT JOIN search_attributed_activity as t3
@@ -317,8 +288,8 @@ build__state_search_dashboard_new = DdSnowflakeSqlOperatorV2(
             WHEN search_type = 'core_search' THEN 'store_search' 
             WHEN suggestion_type = 'cuisine_filter' THEN 'cuisine_filter'
           ELSE search_type END AS search_type
-        , dd_session_id || search_term || dd_device_id || search_type AS search_id
-        , search_timestamp_pst
+        , dd_session_id || search_term || dd_device_id AS search_id --dd_session_id || search_term || dd_device_id || search_type AS search_id
+        , SEARCH_EVENT_START_TIMESTAMP
         , dd_device_id 
         , dd_session_id 
         , is_search_converted
@@ -334,16 +305,16 @@ build__state_search_dashboard_new = DdSnowflakeSqlOperatorV2(
         , fs.region_name
         , experience
         , is_user_id_null
-        , search_timestamp_pst_date
+        , SEARCH_DATE
         FROM edw.consumer.fact_search fs
         LEFT JOIN public.dimension_district as dis on dis.district_id = fs.district_id
-        WHERE search_timestamp_pst_date >= '2023-11-01'
-        AND search_type IN ('core_search', 'vertical_search_from_tab', 'cuisine_filter', 'cuisine_filter_from_browse_tab', 'vertical_search_from_landing', 'item_first_search')
-          AND experience = 'doordash'
+        WHERE SEARCH_EVENT_START_TIMESTAMP::date >= '2023-11-01' -- search event start goes as early as 2023-10-05
+        AND search_type NOT LIKE '%store_sugg%' AND search_type NOT LIKE '%bounced%' AND search_type NOT LIKE '%doubledash%' --IN ('core_search', 'vertical_search_from_tab', 'cuisine_filter', 'cuisine_filter_from_browse_tab', 'vertical_search_from_landing', 'item_first_search')
+        AND experience = 'doordash'
         )
         
         SELECT
-            t2.search_timestamp_pst::date AS dte
+            t2.SEARCH_EVENT_START_TIMESTAMP::date AS dte
             , t2.platform
             , t2.district_name
             , t2.SEARCH_TYPE
@@ -420,6 +391,12 @@ build__state_search_dashboard_new = DdSnowflakeSqlOperatorV2(
                         AND COALESCE(t2.num_store_results, 0) = 0
                     THEN t2.search_id
                 END
+            ) AS store_search_null_sessions,
+            APPROX_COUNT_DISTINCT(
+                CASE
+                    WHEN COALESCE(t2.num_store_results, 0) = 0
+                    THEN t2.search_id
+                END
             ) AS search_null_sessions,
             SUM(DISTINCT
                 CASE
@@ -444,8 +421,6 @@ build__state_search_dashboard_new = DdSnowflakeSqlOperatorV2(
             public.dimension_query_to_vertical_mapping_and_item_score_analytics_dashboard t3
         ON
             LOWER(t2.search_term) = LOWER(t3.search_term)
-        WHERE
-            t2.search_timestamp_pst_date >= '2023-11-01'
             -- and VB.volume_bucket in ('torso','head','tail')
         GROUP BY
             1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19
